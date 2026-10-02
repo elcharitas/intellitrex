@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useMemo } from "react";
-import { SUPPORTED_COINS } from "@/lib/constants";
+import { SUPPORTED_COINS, TIME_RANGES } from "@/lib/constants";
 import { TrendingUp, TrendingDown, Activity } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { sma, bollinger, rsi, logReturnStats, projectionCone, probabilityUp, summarize, crossovers } from "@/lib/signals";
@@ -21,14 +21,6 @@ type FearGreed = {
   lastWeek: { value: number; classification: string };
   lastMonth: { value: number; classification: string };
 };
-
-const TIME_RANGES = [
-  { label: "24H", interval: "60", limit: 24 },
-  { label: "1W", interval: "1440", limit: 7 },
-  { label: "1M", interval: "1440", limit: 30 },
-  { label: "1Y", interval: "1440", limit: 365 },
-  { label: "ALL", interval: "1440", limit: 720 },
-];
 
 function useCandles(url: string) {
   const [result, setResult] = useState<{ url: string; candles: Candle[]; error: string | null } | null>(null);

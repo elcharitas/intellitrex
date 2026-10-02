@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { normalizeDailyPrices } from "@/lib/signals";
+import { TIME_RANGES } from "@/lib/constants";
 
 // Map our pair IDs to CoinGecko IDs
 const PAIR_TO_COINGECKO: Record<string, string> = {
@@ -19,13 +20,24 @@ export async function GET(req: NextRequest) {
   const pair = req.nextUrl.searchParams.get("pair") || "XXBTZUSD";
   const interval = req.nextUrl.searchParams.get("interval") || "1440";
   const limit = req.nextUrl.searchParams.get("limit") || "30";
-  const daily = req.nextUrl.searchParams.get("resolution") === "daily";
+  const resolution = req.nextUrl.searchParams.get("resolution");
+  const daily = resolution === "daily";
 
+  if (!Object.hasOwn(PAIR_TO_COINGECKO, pair)) {
+    return NextResponse.json({ error: "Unsupported currency pair" }, { status: 400 });
+  }
   const coinId = PAIR_TO_COINGECKO[pair];
-  if (!coinId) return NextResponse.json({ error: "Unsupported currency pair" }, { status: 400 });
+  if (resolution !== null && !daily) {
+    return NextResponse.json({ error: "Unsupported resolution" }, { status: 400 });
+  }
 
   // Daily history is independent of the display window and includes indicator warm-up.
-  const days = daily ? "365" : interval === "60" ? "1" : Number(limit) > 365 ? "max" : limit;
+  let days = "365";
+  if (!daily) {
+    const range = TIME_RANGES.find((range) => range.interval === interval && String(range.limit) === limit);
+    if (!range) return NextResponse.json({ error: "Unsupported chart range" }, { status: 400 });
+    days = range.interval === "60" ? "1" : range.limit > 365 ? "max" : String(range.limit);
+  }
 
   try {
     const res = await fetch(

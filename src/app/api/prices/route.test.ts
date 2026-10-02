@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TIME_RANGES } from "@/lib/constants";
 import { GET } from "./route";
 
 const day = 86_400_000;
@@ -39,6 +40,15 @@ describe("price data contract", () => {
     expect(fetchSource.mock.calls[0][1]).toMatchObject({ next: { revalidate: 60 } });
   });
 
+  it.each(TIME_RANGES)("preserves supported window $label", async (range) => {
+    fetchSource.mockResolvedValueOnce(Response.json([[boundary, 100, 105, 95, 102]]));
+    const response = await GET(request(`interval=${range.interval}&limit=${range.limit}`));
+    expect(response.status).toBe(200);
+    const days = range.label === "24H" ? "1" : range.label === "ALL" ? "max" : String(range.limit);
+    expect(fetchSource.mock.calls[0][0]).toContain(`/ohlc?vs_currency=usd&days=${days}`);
+    expect(fetchSource).toHaveBeenCalledOnce();
+  });
+
   it("requests sufficient daily history independently of a short display range", async () => {
     fetchSource.mockResolvedValueOnce(Response.json({
       prices: [...dailyFixture, [boundary, 999], [now, 200]],
@@ -55,8 +65,22 @@ describe("price data contract", () => {
     expect(fetchSource.mock.calls[0][0]).toContain("market_chart?vs_currency=usd&days=365&interval=daily");
   });
 
-  it("does not silently substitute Bitcoin for an unsupported pair", async () => {
-    const response = await GET(request("pair=UNKNOWN"));
+  it.each(["UNKNOWN", "constructor", "toString", "__proto__"])("rejects unsupported pair %s before a source request", async (pair) => {
+    const response = await GET(request(`pair=${pair}`));
+    expect(response.status).toBe(400);
+    expect(fetchSource).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "interval=1440&limit=7%26vs_currency%3Deur",
+    "interval=1440&limit=NaN",
+    "interval=30&limit=7",
+    "interval=60&limit=7",
+    "interval=1440&limit=999999",
+    "resolution=hourly",
+    "resolution=daily%26vs_currency%3Deur",
+  ])("rejects unsupported or injected window inputs: %s", async (query) => {
+    const response = await GET(request(query));
     expect(response.status).toBe(400);
     expect(fetchSource).not.toHaveBeenCalled();
   });

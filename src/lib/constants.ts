@@ -11,6 +11,14 @@ export const SUPPORTED_COINS = [
   { id: "SUIUSD", name: "Sui", symbol: "SUI", pair: "SUIUSD", krakenPair: "SUIUSD" },
 ] as const;
 
+export const TIME_RANGES = [
+  { label: "24H", interval: "60", limit: 24 },
+  { label: "1W", interval: "1440", limit: 7 },
+  { label: "1M", interval: "1440", limit: 30 },
+  { label: "1Y", interval: "1440", limit: 365 },
+  { label: "ALL", interval: "1440", limit: 720 },
+];
+
 export const MODELS = ["XGBoost", "Prophet", "NHITS", "GRU", "Ensemble"] as const;
 
 export const GITHUB_WORKFLOW_REPO = "reallyticsai/Intellitrax_Workflow";
