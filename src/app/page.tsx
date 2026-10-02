@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import {
-  TrendingUp,
   BarChart3,
   Brain,
   Shield,
@@ -12,24 +12,75 @@ import {
   ArrowRight,
 } from "lucide-react";
 
+type Market = {
+  id: string;
+  name: string;
+  symbol: string;
+  current_price: number | null;
+  price_change_percentage_24h: number | null;
+  market_cap: number | null;
+  total_volume: number | null;
+  sparkline_in_7d?: { price: number[] } | null;
+  last_updated: string | null;
+};
+
+function finite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function money(value: number | null | undefined, compact = false) {
+  if (!finite(value)) return "Unavailable";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    notation: compact ? "compact" : "standard",
+    maximumFractionDigits: value < 1 ? 6 : 2,
+  }).format(value);
+}
+
+function Change({ value }: { value: number | null | undefined }) {
+  if (!finite(value)) return <span className="text-muted-foreground">Unavailable</span>;
+  return (
+    <span className={value > 0 ? "text-success" : value < 0 ? "text-danger" : "text-muted-foreground"}>
+      {value > 0 ? "+" : ""}{value.toFixed(2)}%
+    </span>
+  );
+}
+
+function MarketChart({ prices, name }: { prices?: number[]; name: string }) {
+  if (!Array.isArray(prices) || prices.length < 2 || !prices.every((price) => finite(price) && price > 0)) {
+    return <p className="text-sm text-muted-foreground">Seven-day history unavailable</p>;
+  }
+  const min = Math.min(...prices);
+  const span = Math.max(...prices) - min || 1;
+  const points = prices.map((price, i) => `${5 + i / (prices.length - 1) * 490},${145 - (price - min) / span * 130}`).join(" ");
+  return (
+    <svg viewBox="0 0 500 160" className="w-full text-primary" role="img" aria-label={`${name} seven-day price history`}>
+      <title>{`${name} seven-day price history from CoinGecko`}</title>
+      <polygon points={`5,155 ${points} 495,155`} fill="currentColor" fillOpacity="0.08" />
+      <polyline points={points} fill="none" stroke="currentColor" strokeWidth="2" />
+    </svg>
+  );
+}
+
 const FEATURES = [
   {
     icon: LineChart,
     title: "Live Market Data",
     description:
-      "Real-time cryptocurrency prices powered by Kraken exchange. Track 12+ coins with professional-grade charting.",
+      "Cryptocurrency prices from CoinGecko, with price history and source-provided daily changes.",
   },
   {
     icon: Brain,
-    title: "AI-Powered Forecasting",
+    title: "Market Context",
     description:
-      "4 ML models (XGBoost, Prophet, NHITS, GRU) ensembled for 7-day price predictions. Updated daily.",
+      "Compare seven-day price history, market capitalization, trading volume, and daily movers in one place.",
   },
   {
     icon: BarChart3,
     title: "Technical Analysis",
     description:
-      "Built-in indicators — SMA, RSI, Bollinger Bands, volatility scoring, and Fear & Greed Index.",
+      "Explore SMA, RSI, Bollinger Bands, and the Fear & Greed Index on the currency dashboard.",
   },
   {
     icon: Bot,
@@ -41,65 +92,80 @@ const FEATURES = [
     icon: Wallet,
     title: "Portfolio Analysis",
     description:
-      "Connect your Binance account for automated investment analysis. See forecasts mapped to your holdings.",
+      "Connect your Binance account from your profile to review your supported cryptocurrency holdings.",
   },
   {
     icon: Shield,
-    title: "Research-Driven",
+    title: "Education First",
     description:
-      "Built on peer-reviewed research methodologies. Fear & Greed sentiment, multi-model consensus approach.",
+      "Understand market data and the methods behind indicators. Analytics are information, not financial advice.",
   },
 ];
 
-const COINS = [
-  { symbol: "BTC", name: "Bitcoin" },
-  { symbol: "ETH", name: "Ethereum" },
-  { symbol: "SOL", name: "Solana" },
-  { symbol: "XRP", name: "XRP" },
-  { symbol: "ARB", name: "Arbitrum" },
-  { symbol: "DOT", name: "Polkadot" },
-  { symbol: "LINK", name: "Chainlink" },
-  { symbol: "KSM", name: "Kusama" },
-  { symbol: "PYTH", name: "Pyth" },
-  { symbol: "SUI", name: "Sui" },
-];
-
 export default function LandingPage() {
+  const [markets, setMarkets] = useState<Market[] | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/markets", { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Market request failed");
+        const data = await response.json();
+        if (!Array.isArray(data.markets) || !data.markets.length) throw new Error("Market data missing");
+        if (!controller.signal.aborted) setMarkets(data.markets);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setUnavailable(true);
+      });
+    return () => controller.abort();
+  }, []);
+
+  const status = unavailable ? "Market data unavailable. Please try again later." : "Loading market data…";
+  const bitcoin = markets?.find((coin) => coin.id === "bitcoin");
+  const movers: [string, Market[]][] = [
+    ["Gainers", markets?.filter((coin) => finite(coin.price_change_percentage_24h) && coin.price_change_percentage_24h > 0)
+      .sort((a, b) => b.price_change_percentage_24h! - a.price_change_percentage_24h!).slice(0, 3) ?? []],
+    ["Decliners", markets?.filter((coin) => finite(coin.price_change_percentage_24h) && coin.price_change_percentage_24h < 0)
+      .sort((a, b) => a.price_change_percentage_24h! - b.price_change_percentage_24h!).slice(0, 3) ?? []],
+  ];
+
   return (
     <div className="min-h-screen">
-      {/* Hero */}
-      <section className="relative overflow-hidden py-24 px-6">
-        <div className="max-w-7xl mx-auto">
-          <div className="bg-card rounded-3xl p-12 flex flex-col lg:flex-row items-center gap-12">
-            <div className="w-full lg:w-5/12 aspect-[3/4] rounded-2xl bg-gradient-to-br from-primary/80 via-primary/60 to-primary/40 relative overflow-hidden">
-              <div className="absolute inset-0 bg-gradient-to-tr from-transparent via-white/10 to-white/20" />
-              <div className="absolute top-6 left-6 bg-card/90 backdrop-blur rounded-full px-4 py-2 flex items-center gap-2">
-                <div className="w-6 h-6 bg-accent rounded-md flex items-center justify-center">
-                  <span className="text-white text-xs font-bold">*</span>
-                </div>
-                <span className="text-sm font-medium text-foreground">Intellitrex</span>
+      {/* One snapshot feeds every market section; this strip scrolls locally. */}
+      <section aria-label="Market ticker" className="overflow-x-auto border-b border-border bg-card">
+        {markets ? (
+          <div className="flex w-max min-w-full divide-x divide-border">
+            {markets.map((coin) => (
+              <div key={coin.id} className="flex items-center gap-3 px-5 py-3 text-sm">
+                <span className="font-semibold uppercase">{coin.symbol}</span>
+                <span>{money(coin.current_price)}</span>
+                <Change value={coin.price_change_percentage_24h} />
               </div>
-            </div>
+            ))}
+          </div>
+        ) : <p className="px-6 py-3 text-sm text-muted-foreground" role="status">{status}</p>}
+      </section>
 
-            <div className="flex-1 text-center lg:text-left">
+      {/* Hero */}
+      <section className="py-12 px-4 sm:py-20 sm:px-6">
+        <div className="max-w-7xl mx-auto">
+          <div className="grid items-center gap-10 lg:grid-cols-2">
+            <div className="min-w-0">
+              <p className="mb-4 text-sm font-semibold uppercase tracking-wider text-primary">IntelliTrex market overview</p>
               <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold tracking-tight text-foreground leading-tight">
-                THE{" "}
-                <span className="inline-flex items-center justify-center w-12 h-12 bg-accent rounded-lg align-middle">
-                  <TrendingUp className="w-6 h-6 text-white" />
-                </span>{" "}
-                PATH TO FINANCIAL EMPOWERMENT
+                Markets first. Decisions informed.
               </h1>
               <p className="mt-6 text-lg text-muted-foreground max-w-xl">
-                Empower your trades with real-time insights and data-driven decisions.
-                Maximize opportunities and navigate markets confidently with intelligent
-                trading analysis.
+                Start with what the market is doing. Explore real cryptocurrency prices,
+                compare daily movers, and put price history in context.
               </p>
-              <div className="mt-8 flex flex-col sm:flex-row gap-4 justify-center lg:justify-start">
+              <div className="mt-8 flex flex-col sm:flex-row gap-4">
                 <Link
                   href="/currency"
                   className="inline-flex items-center justify-center px-8 py-3.5 bg-foreground text-background rounded-full font-medium hover:opacity-90 transition-opacity"
                 >
-                  Get Started
+                  Explore Markets
                 </Link>
                 <Link
                   href="/consultancy"
@@ -109,29 +175,85 @@ export default function LandingPage() {
                 </Link>
               </div>
             </div>
+            <div className="min-w-0 rounded-3xl border border-border bg-card p-6 sm:p-8">
+              <h2 className="text-lg font-semibold">Bitcoin <span className="text-muted-foreground">/ USD</span></h2>
+              {bitcoin ? (
+                <>
+                  <div className="mt-4 flex flex-wrap items-baseline gap-3">
+                    <p className="text-3xl sm:text-4xl font-bold">{money(bitcoin.current_price)}</p>
+                    <p className="text-sm"><Change value={bitcoin.price_change_percentage_24h} /> <span className="text-muted-foreground">24h</span></p>
+                  </div>
+                  <div className="mt-6">
+                    <MarketChart prices={bitcoin.sparkline_in_7d?.price} name="Bitcoin" />
+                  </div>
+                  <p className="mt-3 text-xs text-muted-foreground">
+                    Seven-day history · CoinGecko snapshot
+                    {bitcoin.last_updated && Number.isFinite(Date.parse(bitcoin.last_updated))
+                      ? ` · Updated ${new Date(bitcoin.last_updated).toLocaleString("en-GB", { timeZone: "UTC" })} UTC`
+                      : " · Source timestamp unavailable"}
+                  </p>
+                </>
+              ) : <p className="mt-6 text-muted-foreground" role="status">{markets ? "Bitcoin data unavailable." : status}</p>}
+            </div>
           </div>
         </div>
       </section>
 
-      {/* Supported Coins */}
-      <section className="py-12 px-6">
+      {/* Market summary */}
+      <section className="py-8 px-4 sm:px-6">
         <div className="max-w-7xl mx-auto">
-          <p className="text-center text-sm text-muted-foreground mb-6 uppercase tracking-wider">
-            Supported Cryptocurrencies
+          <h2 className="text-2xl font-bold">Market summary</h2>
+          <p className="mt-2 mb-6 text-sm text-muted-foreground">
+            Leading markets by capitalization · USD · CoinGecko data cached for 60 seconds · Refresh the page for a new snapshot.
           </p>
-          <div className="flex flex-wrap justify-center gap-4">
-            {COINS.map((coin) => (
-              <div
-                key={coin.symbol}
-                className="bg-card rounded-xl px-5 py-3 flex items-center gap-2 border border-border"
-              >
-                <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center">
-                  <span className="text-xs font-bold text-primary">{coin.symbol[0]}</span>
-                </div>
-                <div>
-                  <p className="text-sm font-medium text-foreground">{coin.symbol}</p>
-                  <p className="text-xs text-muted-foreground">{coin.name}</p>
-                </div>
+          <div className="overflow-x-auto rounded-2xl border border-border bg-card">
+            {markets ? (
+              <table className="w-full min-w-[720px] text-sm">
+                <caption className="sr-only">Market prices, 24-hour changes, capitalization, volume, and seven-day history</caption>
+                <thead className="border-b border-border text-muted-foreground">
+                  <tr>
+                    {["Currency", "Price", "24h change", "Market cap", "24h volume", "7-day history"].map((heading) => (
+                      <th key={heading} scope="col" className="px-4 py-4 text-left font-medium">{heading}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {markets.map((coin) => (
+                    <tr key={coin.id}>
+                      <th scope="row" className="px-4 py-3 text-left font-medium">{coin.name} <span className="text-xs uppercase text-muted-foreground">{coin.symbol}</span></th>
+                      <td className="px-4 py-3 whitespace-nowrap">{money(coin.current_price)}</td>
+                      <td className="px-4 py-3 whitespace-nowrap"><Change value={coin.price_change_percentage_24h} /></td>
+                      <td className="px-4 py-3">{money(coin.market_cap, true)}</td>
+                      <td className="px-4 py-3">{money(coin.total_volume, true)}</td>
+                      <td className="w-36 px-4 py-3"><MarketChart prices={coin.sparkline_in_7d?.price} name={coin.name} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : <p className="p-6 text-muted-foreground" role="status">{status}</p>}
+          </div>
+        </div>
+      </section>
+
+      {/* Top movers */}
+      <section className="py-12 px-4 sm:px-6">
+        <div className="max-w-7xl mx-auto">
+          <h2 className="text-2xl font-bold">Top movers</h2>
+          <p className="mt-2 mb-6 text-sm text-muted-foreground">Among the markets shown, ranked by source-provided 24-hour change.</p>
+          <div className="grid gap-6 md:grid-cols-2">
+            {movers.map(([title, coins]) => (
+              <div key={title} className="min-w-0 rounded-2xl border border-border bg-card p-6">
+                <h3 className="mb-4 font-semibold">{title}</h3>
+                {markets ? (
+                  coins.length ? <ul className="space-y-4">
+                    {coins.map((coin) => (
+                      <li key={coin.id} className="flex flex-wrap justify-between gap-2 text-sm">
+                        <span>{coin.name} <span className="uppercase text-muted-foreground">{coin.symbol}</span></span>
+                        <Change value={coin.price_change_percentage_24h} />
+                      </li>
+                    ))}
+                  </ul> : <p className="text-sm text-muted-foreground">No {title.toLowerCase()} in this snapshot.</p>
+                ) : <p className="text-sm text-muted-foreground" role="status">{status}</p>}
               </div>
             ))}
           </div>
@@ -146,8 +268,8 @@ export default function LandingPage() {
               Everything You Need for Informed Trading
             </h2>
             <p className="mt-4 text-lg text-muted-foreground max-w-2xl mx-auto">
-              Combining cutting-edge machine learning with real-time market data to give you
-              an analytical edge.
+              Move from a market overview to price history, technical indicators,
+              and educational tools.
             </p>
           </div>
 
@@ -171,42 +293,6 @@ export default function LandingPage() {
                 </div>
               );
             })}
-          </div>
-        </div>
-      </section>
-
-      {/* How It Works */}
-      <section className="py-20 px-6 bg-card/50">
-        <div className="max-w-7xl mx-auto">
-          <h2 className="text-3xl md:text-4xl font-bold text-foreground text-center mb-16">
-            How It Works
-          </h2>
-          <div className="grid md:grid-cols-3 gap-8">
-            {[
-              {
-                step: "01",
-                title: "Explore Markets",
-                desc: "Browse live prices, charts, and technical indicators for 12+ cryptocurrencies.",
-              },
-              {
-                step: "02",
-                title: "View AI Forecasts",
-                desc: "See 7-day price predictions from our ensemble of 4 ML models updated daily.",
-              },
-              {
-                step: "03",
-                title: "Get Personalized Advice",
-                desc: "Connect your portfolio and chat with our AI advisor for tailored insights.",
-              },
-            ].map((item) => (
-              <div key={item.step} className="text-center">
-                <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-6">
-                  <span className="text-xl font-bold text-primary">{item.step}</span>
-                </div>
-                <h3 className="text-lg font-semibold text-foreground mb-2">{item.title}</h3>
-                <p className="text-muted-foreground text-sm">{item.desc}</p>
-              </div>
-            ))}
           </div>
         </div>
       </section>

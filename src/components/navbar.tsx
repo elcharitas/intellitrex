@@ -33,7 +33,7 @@ export function Navbar() {
 
   return (
     <nav className="sticky top-0 z-50 bg-card/80 backdrop-blur-md border-b border-border">
-      <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 min-h-16 flex flex-wrap items-center justify-between gap-y-3 py-3 sm:flex-nowrap sm:py-0">
         <Link href="/" className="flex items-center gap-2">
           <div className="w-8 h-8 bg-accent rounded-lg flex items-center justify-center">
             <span className="text-white font-bold text-sm">*</span>
@@ -41,7 +41,7 @@ export function Navbar() {
           <span className="font-semibold text-lg text-foreground">Intellitrex</span>
         </Link>
 
-        <div className="flex items-center gap-8">
+        <div className="order-3 flex w-full items-center justify-center gap-6 sm:order-none sm:w-auto sm:gap-8">
           {NAV_LINKS.map((link) => (
             <Link
               key={link.href}
