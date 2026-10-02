@@ -1,18 +1,18 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import { SUPPORTED_COINS, MODELS } from "@/lib/constants";
+import { useState, useEffect, useMemo } from "react";
+import { SUPPORTED_COINS } from "@/lib/constants";
 import { TrendingUp, TrendingDown, Activity } from "lucide-react";
-import { useAuth } from "@/lib/auth-context";
 import { cn } from "@/lib/utils";
+import { sma, bollinger, rsi, logReturnStats, projectionCone, probabilityUp, summarize, crossovers } from "@/lib/signals";
 
 type Candle = {
   time: number;
-  open: number;
-  high: number;
-  low: number;
+  open: number | null;
+  high: number | null;
+  low: number | null;
   close: number;
-  volume: number;
+  volume: number | null;
 };
 
 type FearGreed = {
@@ -22,13 +22,6 @@ type FearGreed = {
   lastMonth: { value: number; classification: string };
 };
 
-type ForecastRow = Record<string, string>;
-
-type Metrics = Record<
-  string,
-  { MAE?: number; RMSE?: number; R2?: number; [key: string]: number | undefined }
->;
-
 const TIME_RANGES = [
   { label: "24H", interval: "60", limit: 24 },
   { label: "1W", interval: "1440", limit: 7 },
@@ -37,66 +30,31 @@ const TIME_RANGES = [
   { label: "ALL", interval: "1440", limit: 720 },
 ];
 
-function computeSMA(candles: Candle[], period: number): (number | null)[] {
-  return candles.map((_, i) => {
-    if (i < period - 1) return null;
-    const slice = candles.slice(i - period + 1, i + 1);
-    return slice.reduce((sum, c) => sum + c.close, 0) / period;
-  });
+function useCandles(url: string) {
+  const [result, setResult] = useState<{ url: string; candles: Candle[]; error: string | null } | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(url, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Price request failed");
+        const data = await response.json();
+        if (!Array.isArray(data.candles) || !data.candles.length || data.candles.some((point: Candle) =>
+          !point || !Number.isFinite(point.time) || !Number.isFinite(point.close) || point.close <= 0
+        )) throw new Error("Invalid price data");
+        // The API selects the time window; never truncate it by candle count.
+        if (!controller.signal.aborted) setResult({ url, candles: data.candles, error: null });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setResult({ url, candles: [], error: "Price data unavailable. Please try again later." });
+      });
+    return () => controller.abort();
+  }, [url]);
+  const current = result?.url === url ? result : null;
+  return { candles: current?.candles ?? [], error: current?.error, loading: !current };
 }
 
-function computeRSI(candles: Candle[], period = 14): (number | null)[] {
-  const result: (number | null)[] = new Array(candles.length).fill(null);
-  if (candles.length < period + 1) return result;
-
-  let avgGain = 0;
-  let avgLoss = 0;
-  for (let i = 1; i <= period; i++) {
-    const change = candles[i].close - candles[i - 1].close;
-    if (change > 0) avgGain += change;
-    else avgLoss -= change;
-  }
-  avgGain /= period;
-  avgLoss /= period;
-
-  result[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-
-  for (let i = period + 1; i < candles.length; i++) {
-    const change = candles[i].close - candles[i - 1].close;
-    avgGain = (avgGain * (period - 1) + (change > 0 ? change : 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + (change < 0 ? -change : 0)) / period;
-    result[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-  }
-  return result;
-}
-
-function computeBollinger(
-  candles: Candle[],
-  period = 20,
-  mult = 2
-): { upper: (number | null)[]; lower: (number | null)[]; middle: (number | null)[] } {
-  const middle = computeSMA(candles, period);
-  const upper: (number | null)[] = [];
-  const lower: (number | null)[] = [];
-
-  candles.forEach((_, i) => {
-    if (middle[i] === null) {
-      upper.push(null);
-      lower.push(null);
-      return;
-    }
-    const slice = candles.slice(i - period + 1, i + 1);
-    const std = Math.sqrt(
-      slice.reduce((sum, c) => sum + Math.pow(c.close - middle[i]!, 2), 0) / period
-    );
-    upper.push(middle[i]! + mult * std);
-    lower.push(middle[i]! - mult * std);
-  });
-
-  return { upper, lower, middle };
-}
-
-function formatPrice(price: number): string {
+function formatPrice(price: number | null | undefined): string {
+  if (price == null || !Number.isFinite(price)) return "Unavailable";
   if (price >= 1000) return `$${price.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
   if (price >= 1) return `$${price.toFixed(2)}`;
   return `$${price.toFixed(4)}`;
@@ -132,86 +90,82 @@ function FearGreedGauge({ value, label }: { value: number; label: string }) {
 }
 
 export default function CurrencyPage() {
-  const { isPremium } = useAuth();
   const [selectedCoin, setSelectedCoin] = useState(SUPPORTED_COINS[0] as typeof SUPPORTED_COINS[number]);
   const [timeRange, setTimeRange] = useState(TIME_RANGES[1]);
-  const [candles, setCandles] = useState<Candle[]>([]);
   const [fearGreed, setFearGreed] = useState<FearGreed | null>(null);
-  const [forecasts, setForecasts] = useState<ForecastRow[]>([]);
-  const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [selectedModel, setSelectedModel] = useState("xgboost");
-  const [showSMA, setShowSMA] = useState(false);
+  const [fearGreedError, setFearGreedError] = useState(false);
+  const [showSMA, setShowSMA] = useState(true);
   const [showRSI, setShowRSI] = useState(false);
-  const [showBollinger, setShowBollinger] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [showBollinger, setShowBollinger] = useState(true);
+  const [showCone, setShowCone] = useState(false);
+  const [hover, setHover] = useState<{ url: string; index: number } | null>(null);
+  const chartUrl = `/api/prices?pair=${selectedCoin.krakenPair}&interval=${timeRange.interval}&limit=${timeRange.limit}`;
+  const { candles, loading, error } = useCandles(chartUrl);
+  const history = useCandles(`/api/prices?pair=${selectedCoin.krakenPair}&resolution=daily`);
+  const daily = history.candles;
 
-  const fetchPrices = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch(
-        `/api/prices?pair=${selectedCoin.krakenPair}&interval=${timeRange.interval}&limit=${timeRange.limit}`
-      );
-      const data = await res.json();
-      if (data.candles) {
-        // The API selects the time window; candle spacing varies with the range.
-        setCandles(data.candles);
-      }
-    } catch (e) {
-      console.error("Failed to fetch prices", e);
-    }
-    setLoading(false);
-  }, [selectedCoin, timeRange]);
-
-  const fetchForecasts = useCallback(async () => {
-    try {
-      const res = await fetch(
-        `/api/forecasts?pair=${selectedCoin.pair}&model=${selectedModel}`
-      );
-      const data = await res.json();
-      setForecasts(data.forecasts || []);
-      setMetrics(data.metrics || null);
-    } catch (e) {
-      console.error("Failed to fetch forecasts", e);
-    }
-  }, [selectedCoin, selectedModel]);
-
-  const fetchFearGreedData = useCallback(async () => {
-    try {
-      const res = await fetch("/api/fear-greed");
-      const data = await res.json();
-      setFearGreed(data);
-    } catch (e) {
-      console.error("Failed to fetch fear & greed", e);
-    }
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/fear-greed", { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Sentiment unavailable");
+        const data = await response.json();
+        if (![data.current, data.yesterday, data.lastWeek, data.lastMonth].every((entry) =>
+          entry && Number.isFinite(entry.value) && entry.value >= 0 && entry.value <= 100
+        )) throw new Error("Invalid sentiment data");
+        if (!controller.signal.aborted) setFearGreed(data);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setFearGreedError(true);
+      });
+    return () => controller.abort();
   }, []);
 
-  useEffect(() => {
-    fetchPrices();
-    fetchForecasts();
-  }, [fetchPrices, fetchForecasts]);
-
-  useEffect(() => {
-    fetchFearGreedData();
-  }, [fetchFearGreedData]);
+  const signals = useMemo(() => {
+    const closes = daily.map((point) => point.close);
+    const fast = sma(closes, 20);
+    const slow = sma(closes, 50);
+    const bands = bollinger(closes);
+    const strength = rsi(closes);
+    const stats = logReturnStats(closes);
+    const probability = stats ? probabilityUp(stats) : null;
+    const series = daily.map((point, i) => ({
+      ...point, fast: fast[i - 19] ?? null, slow: slow[i - 49] ?? null,
+      upper: bands.upper[i - 19] ?? null, middle: bands.middle[i - 19] ?? null,
+      lower: bands.lower[i - 19] ?? null, strength: strength[i - 14] ?? null,
+    }));
+    const last = series.at(-1);
+    const cone = stats && last ? projectionCone(last.close, stats).map((point) => ({
+      ...point, time: last.time + point.day * 86400,
+    })) : [];
+    const markers = crossovers(series.map((point) => point.fast), series.map((point) => point.slow))
+      .map((cross) => ({ ...cross, time: series[cross.index].time, price: series[cross.index].fast! }));
+    const summary = summarize({
+      sma20: last?.fast, sma50: last?.slow, rsi14: last?.strength, close: last?.close, probability,
+      bands: last?.upper != null ? { upper: last.upper, middle: last.middle!, lower: last.lower! } : null,
+    });
+    return { series, last, cone, probability, markers, summary };
+  }, [daily]);
 
   const latestCandle = candles[candles.length - 1];
   const firstCandle = candles[0];
   const priceChange =
     latestCandle && firstCandle
       ? ((latestCandle.close - firstCandle.close) / firstCandle.close) * 100
-      : 0;
-  const highOfDay = candles.length
-    ? Math.max(...candles.map((c) => c.high))
-    : 0;
-  const lowOfDay = candles.length
-    ? Math.min(...candles.map((c) => c.low))
-    : 0;
-
-  const sma20 = showSMA ? computeSMA(candles, 20) : [];
-  const rsi = showRSI ? computeRSI(candles) : [];
-  const bollinger = showBollinger ? computeBollinger(candles) : null;
-
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+      : null;
+  const highs = candles.map((c) => c.high).filter((value): value is number => value !== null && Number.isFinite(value));
+  const lows = candles.map((c) => c.low).filter((value): value is number => value !== null && Number.isFinite(value));
+  const highOfDay = highs.length ? Math.max(...highs) : null;
+  const lowOfDay = lows.length ? Math.min(...lows) : null;
+  const startTime = firstCandle?.time ?? 0;
+  const lastTime = latestCandle?.time ?? 0;
+  const inWindow = (point: { time: number }) => point.time >= startTime && point.time <= lastTime;
+  const visibleSignals = signals.series.filter(inWindow);
+  const coneReady = !!latestCandle && signals.cone.length === 7 && signals.cone[0].time > lastTime;
+  const cone = showCone && coneReady ? signals.cone : [];
+  const endTime = cone.at(-1)?.time ?? lastTime;
+  const historyMessage = history.loading ? "Loading daily signal history…"
+    : history.error ? "Daily signal history unavailable. Please try again later." : null;
 
   // Chart dimensions with padding for axes
   const padL = 70; // left padding for Y-axis labels
@@ -223,55 +177,49 @@ export default function CurrencyPage() {
   const chartW = svgW - padL - padR;
   const chartH = svgH - padB - padT;
 
-  const minPrice = candles.length ? Math.min(...candles.map((c) => c.low)) * 0.995 : 0;
-  const maxPrice = candles.length ? Math.max(...candles.map((c) => c.high)) * 1.005 : 1;
+  // Only visible overlays affect the price scale, not off-screen daily history.
+  const visiblePrices = [
+    ...candles.flatMap((c) => [c.low ?? c.close, c.high ?? c.close]),
+    ...(showSMA ? visibleSignals.flatMap((point) => [point.fast, point.slow]) : []),
+    ...(showBollinger ? visibleSignals.flatMap((point) => [point.upper, point.lower]) : []),
+    ...cone.flatMap((point) => [point.lower95, point.upper95]),
+  ].filter((value): value is number => value !== null && Number.isFinite(value));
+  const minPrice = visiblePrices.length ? Math.min(...visiblePrices) * 0.995 : 0;
+  const maxPrice = visiblePrices.length ? Math.max(...visiblePrices) * 1.005 : 1;
   const priceRange = maxPrice - minPrice || 1;
 
-  const toX = (i: number, total: number) => padL + (i / Math.max(total - 1, 1)) * chartW;
+  // Candles, daily indicators, and projections share a Unix-time scale.
+  const toX = (time: number) => padL + (time - startTime) / Math.max(endTime - startTime, 1) * chartW;
   const toY = (price: number) =>
     padT + chartH - ((price - minPrice) / priceRange) * chartH;
 
   // Y-axis tick values (5 ticks)
   const yTicks = Array.from({ length: 5 }, (_, i) => minPrice + (priceRange * i) / 4);
 
-  // X-axis date labels (max 6)
-  const xLabelCount = Math.min(candles.length, 6);
+  // UTC axis includes the explicitly labelled future extension when the cone is on.
   const xLabels = candles.length > 1
-    ? Array.from({ length: xLabelCount }, (_, i) => {
-        const idx = Math.floor((i / (xLabelCount - 1)) * (candles.length - 1));
-        const c = candles[idx];
-        const d = new Date(c.time * 1000);
+    ? Array.from({ length: 6 }, (_, i) => {
+        const time = startTime + (endTime - startTime) * i / 5;
+        const d = new Date(time * 1000);
         return {
-          x: toX(idx, candles.length),
-          label: timeRange.interval === "60"
-            ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-            : d.toLocaleDateString([], { month: "short", day: "numeric" }),
+          x: toX(time),
+          label: timeRange.interval === "60" && !cone.length
+            ? d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" })
+            : d.toLocaleDateString("en-GB", { month: "short", day: "numeric", timeZone: "UTC", year: timeRange.limit >= 365 ? "2-digit" : undefined }),
         };
       })
     : [];
 
   const priceLine =
     candles.length > 1
-      ? candles.map((c, i) => `${toX(i, candles.length)},${toY(c.close)}`).join(" ")
+      ? candles.map((c) => `${toX(c.time)},${toY(c.close)}`).join(" ")
       : "";
 
-  const smaLine =
-    sma20.length > 0
-      ? sma20.map((v, i) => (v !== null ? `${toX(i, candles.length)},${toY(v)}` : "")).filter(Boolean).join(" ")
-      : "";
-
-  const forecastLine = forecasts
-    .map((f, i) => {
-      const price = parseFloat(f.Close || f.Predicted_Close || f.Forecast || "0");
-      if (!price) return "";
-      return `${toX(candles.length + i, candles.length + forecasts.length)},${toY(price)}`;
-    })
-    .filter(Boolean)
-    .join(" ");
-
-  const lastRSI = rsi.length > 0 ? rsi[rsi.length - 1] : null;
-
-  const hoverCandle = hoverIdx !== null ? candles[hoverIdx] : null;
+  const signalLine = (key: "fast" | "slow" | "upper" | "middle" | "lower") => visibleSignals
+    .filter((point) => point[key] !== null)
+    .map((point) => `${toX(point.time)},${toY(point[key]!)}`).join(" ");
+  const lastRSI = signals.last?.strength ?? null;
+  const hoverCandle = hover?.url === chartUrl ? candles[hover.index] : undefined;
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     if (candles.length < 2) return;
@@ -279,9 +227,11 @@ export default function CurrencyPage() {
     const rect = svg.getBoundingClientRect();
     const mouseX = ((e.clientX - rect.left) / rect.width) * svgW;
     const dataX = mouseX - padL;
-    if (dataX < 0 || dataX > chartW) { setHoverIdx(null); return; }
-    const idx = Math.round((dataX / chartW) * (candles.length - 1));
-    setHoverIdx(Math.max(0, Math.min(idx, candles.length - 1)));
+    const time = startTime + dataX / chartW * (endTime - startTime);
+    if (dataX < 0 || time > lastTime) { setHover(null); return; }
+    const index = candles.reduce((nearest, candle, i) =>
+      Math.abs(candle.time - time) < Math.abs(candles[nearest].time - time) ? i : nearest, 0);
+    setHover((current) => current?.url === chartUrl && current.index === index ? current : { url: chartUrl, index });
   };
 
   return (
@@ -332,7 +282,7 @@ export default function CurrencyPage() {
               </div>
 
               {/* Price badges */}
-              {latestCandle && (
+              {latestCandle && priceChange !== null && (
                 <div className="flex items-center gap-3 mb-4">
                   <span
                     className={cn(
@@ -361,13 +311,17 @@ export default function CurrencyPage() {
                   <div className="absolute inset-0 flex items-center justify-center">
                     <Activity className="w-8 h-8 text-muted-foreground animate-pulse" />
                   </div>
+                ) : error ? (
+                  <p className="absolute inset-0 flex items-center justify-center p-4 text-center text-sm text-muted-foreground" role="status">{error}</p>
                 ) : (
                   <svg
                     viewBox={`0 0 ${svgW} ${svgH}`}
                     className="w-full h-full"
                     preserveAspectRatio="xMidYMid meet"
+                    role="img"
+                    aria-label={`${selectedCoin.symbol} price and signal chart`}
                     onMouseMove={handleMouseMove}
-                    onMouseLeave={() => setHoverIdx(null)}
+                    onMouseLeave={() => setHover(null)}
                   >
                     {/* Y-axis labels + grid lines */}
                     {yTicks.map((price, i) => (
@@ -404,7 +358,7 @@ export default function CurrencyPage() {
                         key={`x-${i}`}
                         x={lbl.x}
                         y={svgH - 6}
-                        textAnchor="middle"
+                        textAnchor={i === 0 ? "start" : i === xLabels.length - 1 ? "end" : "middle"}
                         fill="currentColor"
                         fillOpacity={0.4}
                         fontSize="9"
@@ -415,19 +369,19 @@ export default function CurrencyPage() {
                     ))}
 
                     {/* Bollinger band fill */}
-                    {bollinger && (() => {
-                      const upperPts = bollinger.upper
-                        .map((v, i) => (v !== null ? `${toX(i, candles.length)},${toY(v)}` : null))
-                        .filter(Boolean);
-                      const lowerPts = bollinger.lower
-                        .map((v, i) => (v !== null ? `${toX(i, candles.length)},${toY(v)}` : null))
-                        .filter(Boolean);
-                      const fillPoly = [...upperPts, ...lowerPts.reverse()].join(" ");
+                    {showBollinger && signalLine("upper") && (() => {
+                      const upper = signalLine("upper");
+                      const lower = signalLine("lower");
+                      const fillPoly = `${upper} ${lower.split(" ").reverse().join(" ")}`;
                       return (
                         <>
                           <polygon points={fillPoly} fill="#a78bfa" fillOpacity="0.06" />
-                          <polyline points={upperPts.join(" ")} fill="none" stroke="#22c55e" strokeWidth="1.2" strokeOpacity="0.7" />
-                          <polyline points={lowerPts.reverse().join(" ")} fill="none" stroke="#ef4444" strokeWidth="1.2" strokeOpacity="0.7" />
+                          <polyline aria-label="Bollinger upper" points={upper} fill="none" stroke="#22c55e" strokeWidth="1.2" />
+                          <polyline aria-label="Bollinger middle" points={signalLine("middle")} fill="none" stroke="#a78bfa" strokeWidth="1.2" />
+                          <polyline aria-label="Bollinger lower" points={lower} fill="none" stroke="#ef4444" strokeWidth="1.2" />
+                          {visibleSignals.length === 1 && (["upper", "middle", "lower"] as const).map((key) => (
+                            <circle key={key} cx={toX(visibleSignals[0].time)} cy={toY(visibleSignals[0][key]!)} r="3" fill="#a78bfa" />
+                          ))}
                         </>
                       );
                     })()}
@@ -442,37 +396,60 @@ export default function CurrencyPage() {
                           </linearGradient>
                         </defs>
                         <polygon
-                          points={`${priceLine} ${toX(candles.length - 1, candles.length)},${padT + chartH} ${toX(0, candles.length)},${padT + chartH}`}
+                          points={`${priceLine} ${toX(lastTime)},${padT + chartH} ${toX(startTime)},${padT + chartH}`}
                           fill="url(#priceGrad)"
                         />
-                        <polyline points={priceLine} fill="none" stroke="#22c55e" strokeWidth="2" />
+                        <polyline aria-label="Observed price" points={priceLine} fill="none" stroke="#22c55e" strokeWidth="2" />
                       </>
                     )}
 
-                    {/* SMA 20 */}
-                    {smaLine && (
-                      <polyline points={smaLine} fill="none" stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="4 2" />
+                    {/* Daily SMA lines and strict crossover markers */}
+                    {showSMA && (
+                      <>
+                        {(["fast", "slow"] as const).map((key) => (
+                          <g key={key} aria-label={key === "fast" ? "SMA 20" : "SMA 50"}>
+                            <polyline points={signalLine(key)} fill="none" stroke={key === "fast" ? "#f59e0b" : "#5b7cfa"} strokeWidth="1.5" />
+                            {visibleSignals.length === 1 && visibleSignals[0][key] !== null && (
+                              <circle cx={toX(visibleSignals[0].time)} cy={toY(visibleSignals[0][key]!)} r="3" fill={key === "fast" ? "#f59e0b" : "#5b7cfa"} />
+                            )}
+                          </g>
+                        ))}
+                        {signals.markers.filter(inWindow).map((marker) => (
+                          <circle key={marker.time} aria-label={`${marker.type} SMA crossover`} cx={toX(marker.time)} cy={toY(marker.price)} r="4" fill={marker.type === "Bullish" ? "#22c55e" : "#ef4444"}>
+                            <title>{`${marker.type} SMA crossover · ${new Date(marker.time * 1000).toISOString()}`}</title>
+                          </circle>
+                        ))}
+                      </>
                     )}
 
-                    {/* Forecast overlay */}
-                    {forecastLine && (
-                      <polyline points={forecastLine} fill="none" stroke="#5b7cfa" strokeWidth="2" strokeDasharray="6 3" />
+                    {/* Projection points occupy real future days, not candle slots. */}
+                    {cone.length > 0 && (
+                      <>
+                        {(["95", "68"] as const).map((band) => (
+                          <polygon key={band} aria-label={`${band}% probability band`}
+                            points={[...cone.map((point) => `${toX(point.time)},${toY(point[`upper${band}`])}`),
+                              ...[...cone].reverse().map((point) => `${toX(point.time)},${toY(point[`lower${band}`])}`)].join(" ")}
+                            fill="#5b7cfa" fillOpacity={band === "95" ? 0.08 : 0.18} />
+                        ))}
+                        <polyline aria-label="Projection median" points={cone.map((point) => `${toX(point.time)},${toY(point.median)}`).join(" ")} fill="none" stroke="#5b7cfa" strokeWidth="2" strokeDasharray="6 3" />
+                        <line x1={toX(lastTime)} x2={toX(lastTime)} y1={padT} y2={padT + chartH} stroke="currentColor" strokeOpacity="0.3" strokeDasharray="3 3" />
+                      </>
                     )}
 
                     {/* Hover crosshair + tooltip */}
-                    {hoverCandle && hoverIdx !== null && (
+                    {hoverCandle && (
                       <>
                         <line
-                          x1={toX(hoverIdx, candles.length)}
+                          x1={toX(hoverCandle.time)}
                           y1={padT}
-                          x2={toX(hoverIdx, candles.length)}
+                          x2={toX(hoverCandle.time)}
                           y2={padT + chartH}
                           stroke="currentColor"
                           strokeOpacity={0.2}
                           strokeDasharray="3 3"
                         />
                         <circle
-                          cx={toX(hoverIdx, candles.length)}
+                          cx={toX(hoverCandle.time)}
                           cy={toY(hoverCandle.close)}
                           r="4"
                           fill="#22c55e"
@@ -480,7 +457,7 @@ export default function CurrencyPage() {
                           strokeWidth="1.5"
                         />
                         <rect
-                          x={Math.min(toX(hoverIdx, candles.length) - 55, svgW - padR - 115)}
+                          x={Math.min(toX(hoverCandle.time) - 55, svgW - padR - 115)}
                           y={Math.max(toY(hoverCandle.close) - 42, padT)}
                           width="110"
                           height="36"
@@ -490,7 +467,7 @@ export default function CurrencyPage() {
                           strokeWidth="1"
                         />
                         <text
-                          x={Math.min(toX(hoverIdx, candles.length), svgW - padR - 60)}
+                          x={Math.min(toX(hoverCandle.time), svgW - padR - 60)}
                           y={Math.max(toY(hoverCandle.close) - 26, padT + 14)}
                           textAnchor="middle"
                           fill="var(--foreground, #e2e8f0)"
@@ -501,17 +478,19 @@ export default function CurrencyPage() {
                           {formatPrice(hoverCandle.close)}
                         </text>
                         <text
-                          x={Math.min(toX(hoverIdx, candles.length), svgW - padR - 60)}
+                          x={Math.min(toX(hoverCandle.time), svgW - padR - 60)}
                           y={Math.max(toY(hoverCandle.close) - 12, padT + 28)}
                           textAnchor="middle"
                           fill="var(--muted-foreground, #94a3b8)"
                           fontSize="8"
                           fontFamily="system-ui"
                         >
-                          {new Date(hoverCandle.time * 1000).toLocaleDateString([], {
+                          {new Date(hoverCandle.time * 1000).toLocaleString("en-GB", {
                             month: "short",
                             day: "numeric",
-                            year: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                            timeZone: "UTC",
                           })}
                         </text>
                       </>
@@ -520,21 +499,45 @@ export default function CurrencyPage() {
                 )}
               </div>
 
+              {showRSI && !loading && !error && (
+                <div className="mt-4">
+                  <p className="mb-2 text-xs text-muted-foreground">RSI 14 · Daily observations · Same UTC time axis</p>
+                  {visibleSignals.some((point) => point.strength !== null) ? (
+                    <svg viewBox="0 0 700 140" className="w-full" role="img" aria-label="RSI 14 daily chart">
+                      {([30, 70] as const).map((value) => (
+                        <g key={value}>
+                          <text x={padL - 6} y={15 + (100 - value) * 1.1} textAnchor="end" fill="currentColor" fontSize="10">{value}</text>
+                          <line x1={padL} x2={svgW - padR} y1={15 + (100 - value) * 1.1} y2={15 + (100 - value) * 1.1} stroke="currentColor" strokeOpacity="0.15" strokeDasharray="3 3" />
+                        </g>
+                      ))}
+                      <polyline points={visibleSignals.filter((point) => point.strength !== null)
+                        .map((point) => `${toX(point.time)},${15 + (100 - point.strength!) * 1.1}`).join(" ")}
+                        fill="none" stroke="#5b7cfa" strokeWidth="2" />
+                      {visibleSignals.filter((point) => point.strength !== null).map((point) => (
+                        <circle key={point.time} cx={toX(point.time)} cy={15 + (100 - point.strength!) * 1.1} r="2" fill="#5b7cfa" />
+                      ))}
+                    </svg>
+                  ) : <p className="text-sm text-muted-foreground">No completed daily RSI observation in this window.</p>}
+                </div>
+              )}
+
               {/* Indicator toggles */}
               <div className="flex flex-wrap gap-3 mt-4">
                 {[
-                  { label: "SMA 20", active: showSMA, toggle: () => setShowSMA(!showSMA), color: "bg-yellow-500" },
-                  { label: "RSI", active: showRSI, toggle: () => setShowRSI(!showRSI), color: "bg-blue-500" },
+                  { label: "SMA crossover", active: showSMA, toggle: () => setShowSMA(!showSMA), color: "bg-yellow-500" },
+                  { label: "RSI 14", active: showRSI, toggle: () => setShowRSI(!showRSI), color: "bg-blue-500" },
                   {
                     label: "Bollinger",
                     active: showBollinger,
                     toggle: () => setShowBollinger(!showBollinger),
                     color: "bg-purple-500",
                   },
+                  { label: "Probability cone", active: showCone, toggle: () => setShowCone(!showCone), color: "bg-primary" },
                 ].map((ind) => (
                   <button
                     key={ind.label}
                     onClick={ind.toggle}
+                    aria-pressed={ind.active}
                     className={cn(
                       "px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors",
                       ind.active
@@ -546,52 +549,38 @@ export default function CurrencyPage() {
                     {ind.label}
                   </button>
                 ))}
-
-                <select
-                  value={selectedModel}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    if (val === "ensemble" && !isPremium) return;
-                    setSelectedModel(val);
-                  }}
-                  className="ml-auto px-3 py-1.5 rounded-lg border border-border bg-card text-foreground text-xs"
-                >
-                  {MODELS.map((m) => {
-                    const val = m.toLowerCase();
-                    const locked = val === "ensemble" && !isPremium;
-                    return (
-                      <option key={m} value={val} disabled={locked}>
-                        {locked ? `\uD83D\uDD12 ${m} (Premium)` : `Forecast: ${m}`}
-                      </option>
-                    );
-                  })}
-                </select>
               </div>
+              <p className="mt-3 text-xs text-muted-foreground">
+                {timeRange.label} historical window · UTC · Daily SMA 20 (amber), SMA 50 (blue), Bollinger bands.
+                {cone.length > 0 ? " + 7-day statistical projection (not a guarantee)." : ""}
+              </p>
+              {historyMessage && <p className="mt-3 text-sm text-muted-foreground" role="status">{historyMessage}</p>}
+              {showCone && !historyMessage && !coneReady && <p className="mt-3 text-sm text-muted-foreground">Projection unavailable: no current daily anchor for this chart.</p>}
             </div>
 
             {/* Bollinger Bands display */}
-            {showBollinger && bollinger && (
+            {showBollinger && (
               <div className="bg-card rounded-2xl p-6 border border-border">
-                <h3 className="font-semibold text-foreground mb-4">Bollinger Bands</h3>
-                <div className="grid grid-cols-3 gap-4">
+                <h3 className="font-semibold text-foreground mb-4">Bollinger Bands (20 daily closes, 2σ)</h3>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                   {[
                     {
                       label: "Upper Bound",
-                      value: bollinger.upper.filter((v): v is number => v !== null).pop(),
+                      value: signals.last?.upper,
                     },
                     {
                       label: "Lower Bound",
-                      value: bollinger.lower.filter((v): v is number => v !== null).pop(),
+                      value: signals.last?.lower,
                     },
                     {
-                      label: "20 Period SMA",
-                      value: bollinger.middle.filter((v): v is number => v !== null).pop(),
+                      label: "20 Day SMA",
+                      value: signals.last?.middle,
                     },
                   ].map((b) => (
                     <div key={b.label}>
                       <p className="text-xs text-muted-foreground">{b.label}</p>
                       <p className="text-lg font-semibold text-foreground">
-                        {b.value ? formatPrice(b.value) : "N/A"}
+                        {formatPrice(b.value)}
                       </p>
                     </div>
                   ))}
@@ -610,16 +599,16 @@ export default function CurrencyPage() {
                   <span
                     className={cn(
                       "px-2 py-1 rounded text-xs font-medium",
-                      lastRSI && lastRSI > 70
+                      lastRSI > 70
                         ? "bg-danger/10 text-danger"
-                        : lastRSI && lastRSI < 30
+                        : lastRSI < 30
                         ? "bg-success/10 text-success"
                         : "bg-muted text-muted-foreground"
                     )}
                   >
-                    {lastRSI && lastRSI > 70
+                    {lastRSI > 70
                       ? "Overbought"
-                      : lastRSI && lastRSI < 30
+                      : lastRSI < 30
                       ? "Oversold"
                       : "Neutral"}
                   </span>
@@ -627,40 +616,6 @@ export default function CurrencyPage() {
               </div>
             )}
 
-            {/* Model Metrics */}
-            {metrics && (
-              <div className="bg-card rounded-2xl p-6 border border-border">
-                <h3 className="font-semibold text-foreground mb-4">Model Performance</h3>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b border-border">
-                        <th className="text-left py-2 text-muted-foreground font-medium">Model</th>
-                        <th className="text-right py-2 text-muted-foreground font-medium">MAE</th>
-                        <th className="text-right py-2 text-muted-foreground font-medium">RMSE</th>
-                        <th className="text-right py-2 text-muted-foreground font-medium">R&sup2;</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {Object.entries(metrics).map(([model, m]) => (
-                        <tr key={model} className="border-b border-border/50">
-                          <td className="py-2 text-foreground font-medium">{model}</td>
-                          <td className="text-right py-2 text-muted-foreground">
-                            {m.MAE?.toFixed(2) || "N/A"}
-                          </td>
-                          <td className="text-right py-2 text-muted-foreground">
-                            {m.RMSE?.toFixed(2) || "N/A"}
-                          </td>
-                          <td className="text-right py-2 text-muted-foreground">
-                            {m.R2?.toFixed(4) || "N/A"}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
           </div>
 
           {/* Right: Stats panel */}
@@ -671,30 +626,25 @@ export default function CurrencyPage() {
               <div className="grid grid-cols-2 gap-3">
                 <div className="rounded-xl bg-success/10 p-4 text-center">
                   <p className="text-xl font-bold text-success">
-                    {latestCandle ? formatPrice(latestCandle.close) : "--"}
+                    {formatPrice(latestCandle?.close)}
                   </p>
-                  <p className="text-xs text-muted-foreground mt-1">Current Price</p>
+                  <p className="text-xs text-muted-foreground mt-1">Latest chart close</p>
                 </div>
                 <div
                   className={cn(
                     "rounded-xl p-4 text-center",
-                    priceChange >= 0 ? "bg-success/10" : "bg-danger/10"
+                    priceChange === null ? "bg-muted" : priceChange >= 0 ? "bg-success/10" : "bg-danger/10"
                   )}
                 >
                   <p
                     className={cn(
                       "text-xl font-bold",
-                      priceChange >= 0 ? "text-success" : "text-danger"
+                      priceChange === null ? "text-muted-foreground" : priceChange >= 0 ? "text-success" : "text-danger"
                     )}
                   >
-                    {priceChange.toFixed(2)}%{" "}
-                    {priceChange >= 0 ? (
-                      <TrendingUp className="w-4 h-4 inline" />
-                    ) : (
-                      <TrendingDown className="w-4 h-4 inline" />
-                    )}
+                    {priceChange === null ? "Unavailable" : `${priceChange.toFixed(2)}%`}
                   </p>
-                  <p className="text-xs text-muted-foreground mt-1">Change</p>
+                  <p className="text-xs text-muted-foreground mt-1">{timeRange.label} range change</p>
                 </div>
                 <div className="rounded-xl border border-border p-4 text-center">
                   <p className="text-lg font-semibold text-foreground">
@@ -711,32 +661,41 @@ export default function CurrencyPage() {
               </div>
             </div>
 
-            {/* 7-Day Forecast */}
-            {forecasts.length > 0 && (
+            <div className="bg-card rounded-2xl p-6 border border-border">
+              <h3 className="font-semibold text-foreground mb-4">Statistical signals, not financial advice.</h3>
+              {historyMessage ? <p className="text-sm text-muted-foreground" role="status">{historyMessage}</p> : (
+                <>
+                  <p className={cn("text-2xl font-bold", signals.summary.label === "Bullish" ? "text-success" : signals.summary.label === "Bearish" ? "text-danger" : "text-muted-foreground")}>
+                    {signals.summary.label} <span className="text-sm font-normal">· Vote total {signals.summary.score}</span>
+                  </p>
+                  <dl className="my-5 grid grid-cols-2 gap-4 text-sm">
+                    <div><dt className="text-muted-foreground">SMA 20</dt><dd>{formatPrice(signals.last?.fast)}</dd></div>
+                    <div><dt className="text-muted-foreground">SMA 50</dt><dd>{formatPrice(signals.last?.slow)}</dd></div>
+                    <div><dt className="text-muted-foreground">RSI 14</dt><dd>{lastRSI === null ? "Unavailable" : lastRSI.toFixed(1)}</dd></div>
+                    <div><dt className="text-muted-foreground">P(up) in 7 days</dt><dd>{signals.probability === null ? "Unavailable" : `${(signals.probability * 100).toFixed(1)}%`}</dd></div>
+                  </dl>
+                  <ul className="space-y-3 text-sm">
+                    {signals.summary.votes.map((vote) => (
+                      <li key={vote.name}><span className="font-semibold">{vote.name}: {vote.vote > 0 ? "+1" : vote.vote}</span><p className="text-muted-foreground">{vote.reason}</p></li>
+                    ))}
+                  </ul>
+                  <p className="mt-5 text-xs text-muted-foreground">
+                    {daily.length} observed daily closes. Last completed close at {signals.last ? new Date(signals.last.time * 1000).toISOString() : "unavailable"}.
+                    Return drift and volatility use the last 90 daily log returns.
+                  </p>
+                </>
+              )}
+            </div>
+
+            {showCone && cone.length > 0 && (
               <div className="bg-card rounded-2xl p-6 border border-border">
-                <h3 className="font-semibold text-foreground mb-4">
-                  7-Day Forecast ({selectedModel})
-                </h3>
-                <div className="space-y-2">
-                  {forecasts.map((f, i) => {
-                    const price = parseFloat(
-                      f.Close || f.Predicted_Close || f.Forecast || "0"
-                    );
-                    return (
-                      <div
-                        key={i}
-                        className="flex justify-between items-center py-1.5 border-b border-border/50 last:border-0"
-                      >
-                        <span className="text-xs text-muted-foreground">
-                          Day {i + 1}
-                        </span>
-                        <span className="text-sm font-medium text-foreground">
-                          {price ? formatPrice(price) : "N/A"}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
+                <h3 className="font-semibold text-foreground mb-3">7-day probability cone</h3>
+                <p className="text-xs text-muted-foreground mb-4">Anchor: {formatPrice(signals.last?.close)} at {new Date(signals.last!.time * 1000).toISOString()}. Assumes normally distributed daily log returns.</p>
+                <dl className="space-y-2 text-sm">
+                  <div><dt className="text-muted-foreground">Day 7 median</dt><dd>{formatPrice(cone[6].median)}</dd></div>
+                  <div><dt className="text-muted-foreground">Day 7 68% interval</dt><dd>{formatPrice(cone[6].lower68)} – {formatPrice(cone[6].upper68)}</dd></div>
+                  <div><dt className="text-muted-foreground">Day 7 95% interval</dt><dd>{formatPrice(cone[6].lower95)} – {formatPrice(cone[6].upper95)}</dd></div>
+                </dl>
               </div>
             )}
 
@@ -752,8 +711,13 @@ export default function CurrencyPage() {
                 </div>
               </div>
             )}
+            {fearGreedError && <p className="text-sm text-muted-foreground">Fear & Greed data unavailable.</p>}
           </div>
         </div>
+        <p className="mt-8 text-xs text-muted-foreground">
+          IntelliTrex provides research and educational analytics, not financial advice. Cryptocurrency markets are volatile.
+          Statistical projections describe a model, not a guarantee of future performance.
+        </p>
       </div>
     </div>
   );
